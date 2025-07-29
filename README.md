@@ -9,8 +9,10 @@ This project explores the modeling and forecasting of **Netflix stock prices** u
 
 ---
 
+# project_language.R
+
 ## Overview
-![R](https://img.shields.io/badge/code-R-blue?logo=r)
+
 In this project, we analyzed the historical stock prices of **Netflix (NFLX)** to explore the effectiveness of various forecasting techniques. The project combines:
 
 - **Exploratory Data Analysis (EDA)** of stock price time series  
@@ -77,3 +79,4 @@ Some parts of GBR may use additional statistical libraries depending on your R s
 
 This project is intended for academic reference only.  
 Unauthorized reuse or modification is not permitted.
+![R](https://img.shields.io/badge/code-R-blue?logo=r)
