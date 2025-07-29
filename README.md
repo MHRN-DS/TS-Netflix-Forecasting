@@ -3,7 +3,7 @@
 This project explores the modeling and forecasting of **Netflix stock prices** using classical and robust statistical approaches. It combines **time series models (ARIMA, ARIMAX)** with **Gradient Boosting Regression (GBR)** using various loss functions (Gaussian, Laplace, Pseudo-Huber) to analyze and predict stock behavior over time.
 
 > **Grade received: 30/30**  
-> **Contributors**: [@MaxHorn](https://github.com/MHRN-DS), [@MikhailIsakov](https://github.com/Mishlen337), [@LennartBredthauer](https://github.com/Lenny945)  
+> **Contributors**: [@MaxHorn](https://github.com/MHRN-DS), [@ElioShyti](https://github.com/ElioShyti2000), [@LennartBredthauer](https://github.com/Lenny945)  
 > **University of Padova, Business, Economic and Financial Data – July 2025**  
 > Supervisor: Prof. Dr. Mariangela Guidolin
 
