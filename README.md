@@ -9,8 +9,6 @@ This project explores the modeling and forecasting of **Netflix stock prices** u
 
 ---
 
-# project_language.R
-
 ## Overview
 
 In this project, we analyzed the historical stock prices of **Netflix (NFLX)** to explore the effectiveness of various forecasting techniques. The project combines:
