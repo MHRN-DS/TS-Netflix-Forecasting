@@ -1,0 +1,387 @@
+---
+title: 'Project: Netflix Forecasting - Gradient Boosting'
+author: "Max Horn, Elio Shyti, Lennart Bredthauer"
+date: "2025-05-25"
+output:
+  html_document: default
+  pdf_document: default
+  mathjax: default
+---
+
+# 0. Title Page
+**Project:** Forecasting Netflix Stock Prices  
+**Course:** (SCP7079231) Business Economic and Financial Data  
+**Team Members:** Max Horn, Elio Shyti, Lennart Bredthauer  
+**Supervisor:** Prof. Dr. M. Guidolin  
+**Date:** `r Sys.Date()`  
+
+```{r Load Required Libraries, include=FALSE}
+library(quantmod)
+library(dplyr)
+library(gbm)
+library(Metrics)
+library(ggplot2)
+library(TTR)
+library(gridExtra)
+library(lubridate)
+```
+The Gaussian model will be the explaining Rmd. for our following experiments with different loss functions (Laplace and Pseudo-Huber).
+
+EXLAMATION! Results are not the same as in the report for this project.
+
+# 1. Data Collection
+We collected historical daily stock price data from Yahoo Finance using the quantmod R package. The dataset includes the Adjusted Closing Prices of Netflix (NFLX) and its major competitors — Disney (DIS), Amazon (AMZN), and Warner Bros. Discovery (WBD) — spanning a 5-year window from r start_date to r Sys.Date().
+```{r Data Collection, message=FALSE, warning=FALSE}
+# 2. Download Stock Data (Netflix + Competitors)
+start_date <- as.Date("2025-06-09") - years(5)
+end_date   <- as.Date("2025-06-09")                 # Fixed cutoff at June 9, 2025
+
+# Pull data
+tickers <- c("NFLX", "DIS", "AMZN", "WBD")
+getSymbols(tickers, src = "yahoo", from = start_date, to = end_date)
+
+# Extract Adjusted Closing Prices
+prices <- merge(Ad(NFLX), Ad(DIS), Ad(AMZN), Ad(WBD))
+colnames(prices) <- c("NFLX", "DIS", "AMZN", "WBD")
+prices <- na.omit(prices)
+```
+# 2. Feature Engineering
+We engineered input features to enrich the model's predictive power, since our "old" model `ARIMA` model showed that the data from Netflix behaves like a `Random Walk` (0,1,0). 
+We introduced in our features:
+- Lagged Prices: 1–3-day lags for all four companies.
+  - Netflix
+  - Disney
+  - Warner Brothers
+  - Amazon
+
+Technical Indicators:
+  - SMA (Simple Moving Average) over 5 days.
+  - RSI (Relative Strength Index) over 14 days.
+    --> The Relative Strength Index (RSI) is a momentum oscillator used in technical analysis to measure the speed and change of price movements.         It ranges from 0 to 100 and helps identify overbought or oversold conditions in a market.
+  - Volatility using 5-day rolling standard deviation.
+- Log Returns: Used as the target variable for the model.
+```{r feature engineering, message = F, warning=F}
+df <- data.frame(Date = index(prices), coredata(prices))
+
+# Lag Features
+for (l in 1:3) {
+  df <- df %>% mutate(
+    !!paste0("NFLX_lag_", l) := lag(NFLX, l), # assign values dynamically with the given name for the columns <- !! operator
+    !!paste0("DIS_lag_", l) := lag(DIS, l),
+    !!paste0("AMZN_lag_", l) := lag(AMZN, l),
+    !!paste0("WBD_lag_", l) := lag(WBD, l)
+  )
+}
+
+# Technical Indicators and KPIs
+df <- df %>% mutate(
+  SMA_5 = SMA(NFLX, 5), # simple moving average for 5 days
+  RSI_14 = RSI(NFLX, 14), # compute the 14-day Relative Strength Index (RSI) for Netflix
+  Volatility = runSD(NFLX, 5), # computing 5-days standard deviation for a volatiltiy proxy
+  Log_Return = log(lead(NFLX, 1)) - log(NFLX) # This line computes the 1-day forward log return for Netflix’s                                                  stock price.
+) %>% na.omit()
+```
+
+# 3. Gradient Boosting Regression (GBR) and Rolling Window
+We implemented a Gradient Boosting machine using the `gbm` package. These are models that build sequential trees and adjust for residual errors at each iteration, promising a high accuracy for prediction, especially in nonlinear TS.
+
+Key Hyperparameters:
+ - `n.trees` = 2500 
+ - `shrinkage` = 0.05
+ - `interaction.depth` = 3
+ 
+We used a rolling window forecast approach for 252-day training window (one trading year). We generated forecasts at 1 to 5-day horizon.
+ 
+In addition, we added a best-, central, and worst-case scenario, based on the SD from the Gaussian Setting. We use it as a range to predict the range of our margin in the interval of confidence. We want to achieve 99 % confidence, therefore we choose 2.58 as multiplier for our interval in comparing best/worst case.
+```{r gbm and rw, message = F, warning=F}
+train_window <- 252 # setting the training window to 1-year of trading
+forecast_horizons <- 1:5 # 1 to 5 days forecast horizon
+forecast_results <- list()
+
+for (h in forecast_horizons) {
+  rolling_preds <- data.frame()
+  for (i in seq(train_window, nrow(df) - h)) {
+    train_data <- df[(i - train_window + 1):i, ]
+    
+    model <- gbm(Log_Return ~ . - Date - Log_Return, # fit the gbm model
+                 data = train_data,
+                 distribution = "gaussian", # we are using the Gaussian Loss Function
+                 n.trees = 2500,
+                 interaction.depth = 3,
+                 shrinkage = 0.05,
+                 verbose = FALSE)
+    
+    pred_return <- predict(model, df[i + 1, ], n.trees = 2500) # Predict the 1-step-ahead log return for the day after the training window.
+    price_today <- df$NFLX[i + 1]
+    pred_price <- price_today * exp(pred_return) # Convert predicted log return into predicted price using exponential transformation
+    
+    sd_err <- sd(train_data$Log_Return - predict(model, train_data, n.trees = 2500), na.rm = TRUE)
+    pred_best <- price_today * exp(pred_return + 2.58 * sd_err) 
+    pred_worst <- price_today * exp(pred_return - 2.58 * sd_err) 
+    
+    # storing the results from our forecast with the for us important data
+    rolling_preds <- rbind(rolling_preds, data.frame(
+      Date = df$Date[i + h],
+      Actual = df$NFLX[i + h],
+      Predicted = pred_price,
+      Best_Case = pred_best,
+      Worst_Case = pred_worst
+    ))
+  }
+  forecast_results[[paste0("Horizon_", h)]] <- rolling_preds # store in our horizon, which is indexed by 1 to 5.
+}
+```
+# 4. Plot Rolling Forecasts for 1–5 Day Horizon
+```{r plot rf 1:5, message=FALSE, warning=FALSE}
+plot_list <- lapply(1:5, function(h) {
+  data <- tail(forecast_results[[paste0("Horizon_", h)]], 60)
+  ggplot(data, aes(x = Date)) +
+    geom_line(aes(y = Actual), color = "black") +
+    geom_line(aes(y = Predicted), color = "blue", linetype = "dashed") +
+    #geom_line(aes(y = Best_Case), color = "forestgreen", linetype = "dotted") +
+    #geom_line(aes(y = Worst_Case), color = "red", linetype = "dotted") +
+    labs(title = paste("Forecast Horizon:", h, "Day(s)"),
+         subtitle = "Zoomed Rolling Window GBR Forecast (Gaussian)",
+         y = "Price (USD)", x = "Date") +
+    theme_minimal()
+})
+
+grid.arrange(grobs = plot_list, ncol = 1)
+```
+
+# 5. Zoomed-In Plot for 5-Day Horizon
+```{r zoom rw, message=FALSE, warning=FALSE}
+data_zoom <- tail(forecast_results[["Horizon_5"]], 30)
+
+zoom_plot <- ggplot(data_zoom, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black") +
+  geom_line(aes(y = Predicted), color = "blue", linetype = "dashed") +
+  #geom_line(aes(y = Best_Case), color = "forestgreen", linetype = "dotted") +
+  #geom_line(aes(y = Worst_Case), color = "red", linetype = "dotted") +
+  labs(title = "Zoomed-In Forecast: 5-Day Ahead",
+       subtitle = "Last 30 Predictions",
+       y = "Price (USD)", x = "Date") +
+  theme_minimal()
+
+print(zoom_plot)
+
+```
+
+# 6. Performance Evaluation
+We are evaluating the model using:
+ - MAE (Mean Absolute Error):
+    Measuring the average absolute difference between predicted and actual prices
+ - RMSE (Root Mean Squared Error)
+    Penalizes large error more heavily due to squaring and is therefore useful in financial models for            preventing large prediction mistakes which will turn out costly.
+ - MAPE (Mean Absolute Percentage Error)
+    Gives out the error as percentage, which will support by plotting our metrics.
+```{r metrics, message=FALSE, warning=FALSE}
+perf_metrics <- data.frame(Horizon = integer(), MAE = numeric(), RMSE = numeric(), MAPE = numeric())
+
+for (h in 1:5) {
+  preds <- forecast_results[[paste0("Horizon_", h)]]
+  mae_val <- mean(abs(preds$Actual - preds$Predicted))
+  rmse_val <- sqrt(mean((preds$Actual - preds$Predicted)^2))
+  mape_val <- mean(abs((preds$Actual - preds$Predicted) / preds$Actual)) * 100
+  perf_metrics <- rbind(perf_metrics, data.frame(Horizon = h, MAE = mae_val, RMSE = rmse_val, MAPE = mape_val))
+}
+
+print(perf_metrics)
+```
+As expected, all metrics worsen as the forecast horizon increases. 
+-> `MAE` almost quadruples from day 1 to day 5.
+-> `RMSE` also grows significantly, representing increasing uncertainity in longer-ranged predictions
+
+However, the 5-day-ahead MAPE remains below 5 %, suggesting strong generalization (which we can still improve by increasing `n.trees` to a higher value (but then, higher running costs)). The divergence between MAPE and RMSE shows that our model might have larger errors in its predictions, likely due to market shocks or historical price dynamics which are individual. `MAE` has linear penalty and RMSE quadratic -> so when RMSE >> MAE we have larger prediction outliers.
+
+```{r large outliers, message=FALSE, warnings = FALSE}
+library(ggplot2)
+
+# Choose a forecast horizon to analyze
+data <- forecast_results[["Horizon_1"]]  # You can change this to Horizon_5, etc.
+
+# Compute absolute error
+data$Error <- abs(data$Actual - data$Predicted)
+
+# Identify top 5 largest errors
+top_outliers <- data[order(-data$Error), ][1:5, ]
+
+# Plot predictions vs actual
+ggplot(data, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black", size = 1) +
+  geom_line(aes(y = Predicted), color = "blue", linetype = "dashed", size = 1) +
+  geom_point(data = top_outliers, aes(y = Predicted), color = "red", size = 3) +
+  geom_text(data = top_outliers, aes(y = Predicted, label = round(Error, 2)), 
+            vjust = -1, color = "red", size = 3) +
+  labs(title = "Forecast vs Actual (Top Outliers Highlighted)",
+       subtitle = "Red points = largest prediction errors",
+       y = "Price (USD)", x = "Date") +
+  theme_minimal()
+
+```
+We see that our larger outliers in the model are suddendly drops and jumps in stock price.
+```{r error over time, message=FALSE, warning=FALSE}
+ggplot(data, aes(x = Date, y = Error)) +
+  geom_line(color = "darkred") +
+  geom_point(data = top_outliers, color = "red", size = 2) +
+  labs(title = "Prediction Error Over Time",
+       subtitle = "Spikes indicate large deviations",
+       y = "Absolute Error (USD)", x = "Date") +
+  theme_minimal()
+```
+This Error-Over Time plot confirms our predicted (large errors) "outliers".
+
+# 7. Variable Importance
+Hence, the examination of the influence of features (especially external) is of interest. We want to determine the features which are the most "important" for our model.
+```{r relative influence, message = FALSE, warning = FALSE}
+full_model <- gbm(Log_Return ~ . - Date - Log_Return,
+                  data = df,
+                  distribution = "gaussian",
+                  n.trees = 2500,
+                  interaction.depth = 3,
+                  shrinkage = 0.05,
+                  verbose = FALSE)
+
+summary(full_model, las = 1, cBar = 10)
+```
+As we can observe lagged values and netflix-specific indicator such as RSI\n 
+$$
+\text{RSI} = 100 - \left( \frac{100}{1 + RS} \right)
+\quad \text{where} \quad
+RS = \frac{\text{Average Gain over } n \text{ periods}}{\text{Average Loss over } n \text{ periods}}
+$$
+\n and Volatility were amongst the most important predictors. In addition, external variables from AMAZON and DISNEY also demonstrage a higher relative influence.
+
+# 8. 5-day Ahead Forecast
+We now use the final model trained on the most recent 252 days, we forecasted the next 5 trading days, incorporating simulated updates to lag features and indicators.
+This includes:
+ - a point estimate (predicted price)
+ - a best case (upper bound)
+ - a worst case (lower bound)
+
+```{r}
+# 5-day ahead forecast — Gaussian version
+
+latest_data <- tail(df, 252) # training window for final model
+future_forecast <- data.frame() # Create an empty data frame to store the 5-day forecast
+
+# Train final Gaussian model
+final_model <- gbm(Log_Return ~ . - Date - Log_Return,
+                   data = latest_data,
+                   distribution = "gaussian",
+                   n.trees = 2500,
+                   interaction.depth = 3,
+                   shrinkage = 0.05,
+                   verbose = FALSE)
+
+# Compute error spread
+train_preds <- predict(final_model, latest_data, n.trees = 2500) 
+train_resid <- latest_data$Log_Return - train_preds
+sd_err <- sd(train_resid, na.rm = TRUE)
+
+# Generate next 5 business days
+last_date <- max(df$Date)
+next_dates <- seq(from = last_date + 1, by = 1, length.out = 10)
+next_dates <- next_dates[weekdays(next_dates) %in% c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")][1:5]
+
+# Start from latest observation
+last_row <- tail(df, 1) # row with latest values for all lag features and indicators
+
+# Simulate next 5 days ahead
+for (d in 1:5) {
+  pred_return <- predict(final_model, last_row, n.trees = 2500)
+  price_today <- last_row$NFLX
+  pred_price <- price_today * exp(pred_return)
+  
+  best_case <- price_today * exp(pred_return + 2.58 * sd_err)
+  worst_case <- price_today * exp(pred_return - 2.58 * sd_err)
+  
+  # forecasted date
+  next_date <- next_dates[d]
+  
+  future_forecast <- rbind(future_forecast, data.frame(
+    Day = d,
+    Date = next_date,
+    Predicted = pred_price,
+    Best_Case = best_case,
+    Worst_Case = worst_case
+  ))
+  
+  # Update last_row
+  new_row <- last_row
+  new_row$NFLX <- pred_price
+  
+  # Shift lag features (older ones get pushed down 1 unit, new values are inserted in lag 1)
+  for (l in 3:2) {
+    new_row[[paste0("NFLX_lag_", l)]] <- new_row[[paste0("NFLX_lag_", l - 1)]]
+    new_row[[paste0("DIS_lag_", l)]] <- new_row[[paste0("DIS_lag_", l - 1)]]
+    new_row[[paste0("AMZN_lag_", l)]] <- new_row[[paste0("AMZN_lag_", l - 1)]]
+    new_row[[paste0("WBD_lag_", l)]] <- new_row[[paste0("WBD_lag_", l - 1)]]
+  }
+  new_row$NFLX_lag_1 <- new_row$NFLX
+  new_row$DIS_lag_1 <- tail(df$DIS, 1)
+  new_row$AMZN_lag_1 <- tail(df$AMZN, 1)
+  new_row$WBD_lag_1 <- tail(df$WBD, 1)
+  
+  # Technical indicators
+  
+  # SMA: 5-day moving average (use last 4 real + 1 predicted price)
+  temp_series <- c(tail(df$NFLX, 4), new_row$NFLX)
+  new_row$SMA_5 <- mean(temp_series)
+  
+  simulated_prices <- c(tail(df$NFLX, 13), future_forecast$Predicted)
+  temp_rsi_series <- c(simulated_prices, pred_price)
+  
+  # This checks if there are at least 14 non-NA values in your price series.
+  
+  # Uses tryCatch() to safely calculate RSI.
+
+    # If RSI works → great!
+    # If RSI throws an error (e.g. not enough values) → safely return NA instead of crashing the script.
+    # If TRUE, then it’s safe to compute RS
+  
+  
+  # If not enough data points (fewer than 14), don’t even try — just assign NA.
+  
+  # If the calculated RSI is NA, then:
+    # Use the previous known RSI value (last_row$RSI_14)
+    # This ensures no missing value goes into the model
+  
+  if (sum(!is.na(temp_rsi_series)) >= 14) {
+    rsi_val <- tryCatch({ RSI(temp_rsi_series, 14)[length(temp_rsi_series)] }, error = function(e) NA)
+  } else {
+    rsi_val <- NA
+  }
+  new_row$RSI_14 <- ifelse(is.na(rsi_val), last_row$RSI_14, rsi_val)
+  new_row$Volatility <- sd(temp_series)
+  
+  last_row <- new_row # this becomes input for next day’s forecast
+}
+
+# Output table
+print(future_forecast)
+```
+
+
+
+```{r}
+# Plot scenario forecast
+ggplot(future_forecast, aes(x = Date)) +
+  geom_line(aes(y = Predicted), color = "blue", linetype = "dashed", size = 1.1) +
+  geom_line(aes(y = Best_Case), color = "forestgreen", linetype = "dotted", size = 1) +
+  geom_line(aes(y = Worst_Case), color = "red", linetype = "dotted", size = 1) +
+  geom_point(aes(y = Predicted), color = "blue") +
+  geom_point(aes(y = Best_Case), color = "forestgreen") +
+  geom_point(aes(y = Worst_Case), color = "red") +
+  labs(title = "5-Day Ahead Forecast with Scenario Bounds",
+       subtitle = "Best (Green), Predicted (Blue), Worst (Red)",
+       x = "Date", y = "Forecasted Price (USD)") +
+  theme_minimal()
+```
+ 
+
+
+
+
+
+

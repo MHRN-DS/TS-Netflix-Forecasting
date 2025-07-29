@@ -1,0 +1,338 @@
+---
+title: 'Project: Netflix Forecasting'
+author: "Max Horn, Elio Shyti, Lennart Bredthauer"
+date: "2025-04-18"
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r setup, include=FALSE}
+
+library(quantmod)
+library(zoo)
+library(lubridate)
+library(ggplot2)
+library(readr)
+library(knitr)
+library(tseries)
+library(forecast)
+library(Metrics)
+library(tidyverse)
+```
+
+
+ 
+
+```{r data-download-save, message = FALSE, warning=FALSE}
+
+# Define starting and end date
+start_date <- as.Date("2025-06-09") - years(5)
+end_date   <- as.Date("2025-06-09")
+
+
+# Download historical Netflix stock data from Yahoo Finance
+getSymbols("NFLX", src="yahoo", from=start_date, to=end_date)
+netflix_all_data <- NFLX
+netflix_all_data <- data.frame(Date = index(netflix_all_data), coredata(netflix_all_data))
+
+# Get Adjusted Close Price
+netflix_ad_close <- Ad(NFLX)
+
+# Save Adjusted Closed Price in a csv file
+write.zoo(netflix_ad_close, file="netflix_ad_close.csv", sep=",")
+```
+
+
+
+```{r load-netflix-and-rename-column, smessage=FALSE, warning=FALSE}
+
+#Load the saved dataset
+netflix <- read.csv("netflix_ad_close.csv")
+
+# Rename Columns
+colnames(netflix) <- c("Date", "Adjusted")
+
+# Convert the date column
+netflix$Date <- as.Date(netflix$Date)
+```
+
+
+
+```{r netflix-data-overview, message=FALSE, warning=FALSE}
+
+# Show first few columns of the whole dataset (including open, high, low, close, etc.)
+kable(head(netflix_all_data), caption = "Sample of the Netflix Stock Dataset")
+
+# Summary statistic for the  Adjusted Closing Price
+summary_vals <- summary(netflix$Adjusted)
+
+# Convert to data frame for cleaner display
+summary_df <- data.frame(
+  Statistic = names(summary_vals),
+  Value = round(as.numeric(summary_vals), 2))
+
+# Display summary 
+kable(summary_df, caption = "Summary of Netflix Adjusted Closing Prices")
+
+# Get time range and number of observations
+start_date
+end_date <- max(netflix$Date)
+n_obs <- nrow(netflix)
+
+cat("Time range:", format(start_date), "to", format(end_date), "\n")
+cat("Number of observations:", n_obs, "\n")
+```
+
+
+```{r checking-missing-values, message=FALSE, warning=FALSE}
+
+# Check for missing values 
+n_missing_val <- sum(is.na(netflix))
+cat("Number of missing values:", n_missing_val, "\n")
+```
+
+
+
+```{r plot-netflix-adjusted-close, message=FALSE, warning=FALSE}
+
+#Use adjusted closing price for modeling
+
+# Plot Netflix Adjusted Closing Price over time
+ggplot(netflix, aes(x = Date, y = Adjusted)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Netflix Adjusted Closing Price",
+       x = "Dates", y = "Price (USD)") +
+  theme_minimal()
+```
+
+
+
+```{r plot-netflix-normalized-adjusted-close, message=FALSE, warning=FALSE}
+
+# Z-score normalization of Adjusted Closing Price
+netflix$Normalized <- scale(netflix$Adjusted)
+
+# Plot the normalized pirce
+ggplot(netflix, aes(x = Date, y = Normalized)) +
+  geom_line(color = "steelblue") +
+  labs(x = "Dates", y = "Value") +
+  theme_minimal()
+```
+
+
+
+```{r plot-rolling-mean-sd, message=FALSE, warning=FALSE}
+
+# Calculate the 21-day rolling mean and standard deviation
+roll_mean <- rollmean(netflix$Adjusted, k = 21, fill = NA)
+roll_sd <- rollapply(netflix$Adjusted, width = 21, FUN = sd, fill = NA)
+
+# Plot price with its rolling stats
+plot(netflix$Date, netflix$Adjusted, type = "l", col = "gray",
+     main = "Rolling Mean and Standard Deviation (k = 21)",
+     ylab = "Price", xlab = "Date")
+
+# Rolling mean
+lines(netflix$Date, roll_mean, col = "blue", lwd = 2)
+
+# Rolling SD
+lines(netflix$Date, roll_sd * 10, col = "red", lwd = 2)
+
+legend("topright", legend = c("Rolling Mean", "Rolling SD by a factor of 10"),
+       col = c("blue", "red"), lty = 1, lwd = 2)
+```
+
+
+```{r adf-test-adjusted, message=FALSE, warning=FALSE}
+
+# ADF test for stationarity
+# p > 0.05 -> non-stationary
+adf.test(netflix$Adjusted)
+```
+
+
+
+```{r stl-decomposition-netflix, message=FALSE, warning=FALSE}
+
+# Convert Adjusted Close to time series (252 trading days/year)
+netflix_ts <- ts(netflix$Adjusted, frequency = 252)
+
+# STL decomposition (trend, seasonal, remainder)
+decomp <- stl(netflix_ts, s.window = "periodic")
+
+# Plot decomposition
+plot(decomp, main = "STL Decomposition of Netflix Adjusted Close")
+```
+
+
+
+```{r plot-first-diffrence, message=FALSE, warning=FALSE}
+
+# First-order differencing to remove trend
+diff1 <- diff(netflix_ts, differences = 1)
+
+# Plot differenced series
+plot(diff1, main = "First Differencing")
+```
+
+
+```{r adf-test-differenced, message=FALSE, warning=TRUE}
+
+# ADF test on first-differenced series
+# p < 0.05 -> stationary
+netflix_ts_plt <- ts(netflix$Adjusted, frequency = 1)
+diff1_plt <- diff(netflix_ts_plt, differences = 1)
+adf.test(diff1_plt)
+```
+
+
+```{r plot-acf-diff1, message=FALSE, warning=FALSE}
+
+# ACF of first-differenced series
+# Used to identify MA(q)
+acf(diff1_plt)
+```
+
+
+```{r plot-pacf-diff1, message=FALSE, warning=FALSE}
+
+# PACF of first-differenced series
+# Used to identify AR(p)
+pacf(diff1_plt)
+```
+
+
+```{r auto-arima-summary, message=FALSE, warning=FALSE}
+
+# Fit best ARIMA model automatically
+model <- auto.arima(netflix_ts)
+
+# Model summary
+summary(model)
+```
+
+ 
+
+```{r check-residuals-auto-arima, message=FALSE, warning=FALSE}
+
+# Residual diagnostics: ACF, histogram, Q-Q plot, Ljung-Box test
+checkresiduals(model)
+```
+
+ 
+
+ 
+```{r rolling-forecast-arima010, message=FALSE, warning=FALSE}
+
+# Rolling window forecast: ARIMA(0,1,0)
+train_window_size <- 252  # training length  is aprrox. 1 year
+forecast_horizon <- 5  #forecast 5 days ahead
+
+# Store predictions and actuals
+all_forecasts <- c()
+all_actuals <-c()
+
+netflix_series <- as.numeric(netflix$Adjusted)
+
+# Rolling forecast loop
+for (i in seq(1, length(netflix_series) - train_window_size - forecast_horizon + 1, by = forecast_horizon)) {
+  
+  # Select rolling training window
+  train_data <- netflix_series[i:(i + train_window_size - 1)]
+  
+  # Fit ARIMA(0,1,0) model on training data
+  model_1 <- Arima(train_data, order = c(0,1,0))
+  
+  # Generate forecast for the next 5 days
+  forecasted <- forecast(model_1, h = forecast_horizon)$mean
+  
+  # Store forecasts and corresponding actual values
+  all_forecasts <- c(all_forecasts, forecasted)
+  actuals <- netflix_series[(i + train_window_size):(i + train_window_size + forecast_horizon - 1)]
+  all_actuals <- c(all_actuals, actuals)
+}
+```
+
+
+```{r evaluate-rolling-forecast, message=FALSE, warning=FALSE}
+
+# Check if forecast and actual vectors are the same length
+length(all_forecasts) == length(all_actuals)
+
+# Calculate accuracy metrics
+rmse_score <- rmse(all_actuals, all_forecasts)
+mae_score <- mae(all_actuals, all_forecasts)
+mape_score <- mape(all_actuals, all_forecasts) * 100  
+
+# Print  rounded results
+cat("RMSE:", round(rmse_score, 2), "\n")
+cat("MAE:", round(mae_score, 2), "\n")
+cat("MAPE:", round(mape_score, 2), "%\n")
+
+```
+ 
+ 
+```{r rolling-forecast-mae-by-horizon, message=FALSE, warning=FALSE}
+
+# MAE by forecast horizon (1 to 21 days)
+train_window_size <- 252
+max_forecast_horizon <- 21 
+mae_results <- numeric()
+horizons <- 1:max_forecast_horizon
+
+# Outer loop over forecast horizons
+for (h in horizons) {
+  all_forecasts <- c()
+  all_actuals <- c()
+  
+  # Rolling forecast over time
+  for (i in seq(1, length(netflix_series) - train_window_size - h + 1, by = h)) {
+    
+    # Select the training data
+    train_data <- netflix_series[i:(i + train_window_size - 1)]
+    model <- Arima(train_data, order = c(0, 1, 0))
+    
+    # Generate forecast for the next h days
+    forecasted <- forecast(model, h = h)$mean
+    
+    # Store forecasts and corresponding actual values
+    actuals <- netflix_series[(i + train_window_size):(i + train_window_size + h - 1)]
+    all_forecasts <- c(all_forecasts, as.numeric(forecasted))
+    all_actuals <- c(all_actuals, as.numeric(actuals))
+  }
+  
+  # Check if forecast and actual vectors are same, else stop the loop
+  if (length(all_forecasts) != length(all_actuals)) {
+  stop("Forecast and actual vectors have mismatched lengths. Check loop boundaries.")
+  }
+  # Compute MAE for this forecast horizon
+  mae_h <- mae(all_actuals, all_forecasts)
+  mae_results <- c(mae_results, mae_h)
+}
+```
+ 
+  
+```{r plot-mae-diffrent-horizions, message=FALSE, warning=FALSE}
+
+# Create a results dataframe to display with different horizions and corresponding MAEs values
+results_df <- data.frame(
+  Horizon = horizons,
+  MAE = mae_results
+)
+
+# Plot MAEs against horizion
+ggplot(results_df, aes(x = Horizon, y = MAE)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(color = "darkblue", size = 2) +
+  labs(
+    title = "Forecast Accuracy Across Horizons",
+    subtitle = "MAE for ARIMA(0,1,0) with 1- to 21-Day Horizons",
+    x = "Forecast Horizon (Days Ahead)",
+    y = "Mean Absolute Error (MAE)"
+  ) +
+  theme_minimal(base_size = 13) +
+  geom_smooth(method = "loess", se = FALSE, color = "gray50", linetype = "dashed")
+
+```
+
+ 

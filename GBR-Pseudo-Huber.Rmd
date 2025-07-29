@@ -1,0 +1,223 @@
+---
+title: "Huber_TEST"
+output: html_document
+---
+
+---
+title: "Netflix Forecast with PseudoHuber Loss"
+author: "Max Horn, Elio Shyti, Lennart Bredthauer"
+date: "09.06.2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(quantmod)      # for downloading stock data
+library(dplyr)         # data manipulation
+library(ggplot2)       # plotting
+library(TTR)           # technical indicators
+library(xgboost)       # XGBoost for Huber loss implementation
+library(lubridate)     # date handling
+library(Matrix)        # matrix conversion for XGBoost
+library(gridExtra)     # grid of plots
+```
+
+## 1. Data Collection and Feature Engineering
+```{r}
+start_date <- as.Date("2025-06-06") - years(5)
+tickers <- c("NFLX", "DIS", "AMZN", "WBD")
+getSymbols(tickers, src = "yahoo", from = start_date)
+
+# Merge adjusted prices and clean
+data <- merge(Ad(NFLX), Ad(DIS), Ad(AMZN), Ad(WBD))
+colnames(data) <- tickers
+data <- na.omit(data)
+
+# Convert to DataFrame
+df <- data.frame(Date = index(data), coredata(data))
+
+# Add lagged features (lags 1–3)
+for (l in 1:3) {
+  df <- df %>% mutate(
+    !!paste0("NFLX_lag_", l) := lag(NFLX, l),
+    !!paste0("DIS_lag_", l) := lag(DIS, l),
+    !!paste0("AMZN_lag_", l) := lag(AMZN, l),
+    !!paste0("WBD_lag_", l) := lag(WBD, l)
+  )
+}
+
+# Technical indicators + target variable (Log Return)
+df <- df %>% mutate(
+  SMA_5 = SMA(NFLX, 5),
+  RSI_14 = RSI(NFLX, 14),
+  Volatility = runSD(NFLX, 5),
+  Log_Return = log(lead(NFLX, 1)) - log(NFLX)
+) %>% na.omit()
+```
+
+## 2. Forecast with Huber Loss using XGBoost
+```{r}
+train_window <- 252
+forecast_horizons <- 1:5
+forecast_results_huber <- list()
+
+for (h in forecast_horizons) {
+  rolling_preds <- data.frame()
+  for (i in seq(train_window, nrow(df) - h)) {
+    train_data <- df[(i - train_window + 1):i, ]
+    x_train <- train_data %>% select(-Date, -Log_Return)
+    y_train <- train_data$Log_Return
+    dtrain <- xgb.DMatrix(data = as.matrix(x_train), label = y_train)
+
+    model <- xgb.train(
+      params = list(objective = "reg:pseudohubererror", eta = 0.05, max_depth = 3),
+      data = dtrain,
+      nrounds = 2500,
+      verbose = 0
+    )
+
+    x_next <- df[i + 1, ] %>% select(-Date, -Log_Return)
+    pred_return <- predict(model, xgb.DMatrix(as.matrix(x_next)))
+    price_today <- df$NFLX[i + 1]
+    pred_price <- price_today * exp(pred_return)
+
+    # Error estimation for scenario bounds (MAE is used for Huber robustness)
+    train_preds <- predict(model, dtrain)
+    mae_err <- mean(abs(y_train - train_preds))
+    pred_best <- price_today * exp(pred_return + 1.5 * mae_err)
+    pred_worst <- price_today * exp(pred_return - 1.5 * mae_err)
+
+    rolling_preds <- rbind(rolling_preds, data.frame(
+      Date = df$Date[i + h],
+      Actual = df$NFLX[i + h],
+      Predicted = pred_price,
+      Best_Case = pred_best,
+      Worst_Case = pred_worst
+    ))
+  }
+  forecast_results_huber[[paste0("Horizon_", h)]] <- rolling_preds
+}
+```
+
+## 3. Plot Forecasts with Scenario Bounds (Huber)
+```{r}
+plot_list_huber <- lapply(1:5, function(h) {
+  data <- tail(forecast_results_huber[[paste0("Horizon_", h)]], 60)
+  ggplot(data, aes(x = Date)) +
+    geom_line(aes(y = Actual), color = "black") +
+    #geom_line(aes(y = Predicted), color = "blue", linetype = "dashed") +
+    #geom_line(aes(y = Best_Case), color = "forestgreen", linetype = "dotted") +
+    #geom_line(aes(y = Worst_Case), color = "red", linetype = "dotted") +
+    labs(title = paste("Huber Forecast Horizon:", h, "Day(s)"),
+         subtitle = "Zoomed Rolling Window Forecast",
+         y = "Price (USD)", x = "Date") +
+    theme_minimal()
+})
+
+grid.arrange(grobs = plot_list_huber, ncol = 1)
+```
+
+## 4. Zoomed-In Forecast (Huber, Last 30 Observations)
+```{r}
+data_zoom <- tail(forecast_results_huber[["Horizon_5"]], 30)
+
+ggplot(data_zoom, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black") +
+  geom_line(aes(y = Predicted), color = "blue", linetype = "dashed") +
+  #geom_line(aes(y = Best_Case), color = "forestgreen", linetype = "dotted") +
+  #geom_line(aes(y = Worst_Case), color = "red", linetype = "dotted") +
+  labs(title = "Zoomed-In Forecast: 5-Day Ahead (PseudoHuber)",
+       subtitle = "Predicted (Blue)",
+       y = "Price (USD)", x = "Date") +
+  theme_minimal()
+```
+
+## 5. Performance Metrics for Huber Model
+```{r}
+huber_metrics <- data.frame(Horizon = integer(), MAE = numeric(), RMSE = numeric(), MAPE = numeric())
+
+for (h in 1:5) {
+  preds <- forecast_results_huber[[paste0("Horizon_", h)]]
+  mae_val <- mean(abs(preds$Actual - preds$Predicted))
+  rmse_val <- sqrt(mean((preds$Actual - preds$Predicted)^2))
+  mape_val <- mean(abs((preds$Actual - preds$Predicted) / preds$Actual)) * 100
+  huber_metrics <- rbind(huber_metrics, data.frame(Horizon = h, MAE = mae_val, RMSE = rmse_val, MAPE = mape_val))
+}
+
+print(huber_metrics)
+```
+
+## Explanation
+- We used `reg:pseudohubererror`, which is a robust loss function that blends L1 and L2.
+- MAE-based error spread was used to construct best/worst-case bands.
+- This method is more stable than Gaussian when extreme values or outliers are present.
+- Visualizations are consistent with the Gaussian/Laplace models for comparability.
+
+## 6. Variable Importance (Huber)
+
+We examine the influence of input features under the Huber loss framework. This helps identify which technical indicators and external stock signals have the greatest predictive power for Netflix.
+
+```{r variable_importance_huber, message=FALSE, warning=FALSE}
+# Train full model on all data using Huber loss
+x_full <- df %>% select(-Date, -Log_Return)
+y_full <- df$Log_Return
+dtrain_full <- xgb.DMatrix(data = as.matrix(x_full), label = y_full)
+
+full_huber_model <- xgb.train(
+  params = list(objective = "reg:pseudohubererror", eta = 0.05, max_depth = 3),
+  data = dtrain_full,
+  nrounds = 2500,
+  verbose = 0
+)
+
+# Extract and plot importance
+importance_huber <- xgb.importance(feature_names = colnames(x_full), model = full_huber_model)
+
+# Custom plot mimicking gbm::summary()
+xgb.plot.importance(importance_huber, top_n = 10,
+                    rel_to_first = TRUE,
+                    cex = 0.8,
+                    las = 1,
+                    xlab = "Relative influence",
+                    main = "PseudoHuber Model - Feature Importance",
+                    col = colorRampPalette(c("cyan", "blue"))(10))
+  xlim(0, 17)  # Optional: expand x-axis
+
+
+```
+
+## 7. Forecast Diagnostics – Outliers and Error Tracking
+
+library(ggplot2)
+```{r}
+# Analyze 1-day forecast horizon
+data <- forecast_results_huber[["Horizon_1"]]
+data$Error <- abs(data$Actual - data$Predicted)
+
+# Identify top 5 outliers by absolute error
+top_outliers <- data[order(-data$Error), ][1:5, ]
+
+# Plot predictions vs actuals with outliers marked
+ggplot(data, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black", size = 1) +
+  geom_line(aes(y = Predicted), color = "blue", linetype = "dashed", size = 1) +
+  geom_point(data = top_outliers, aes(y = Predicted), color = "red", size = 3) +
+  geom_text(data = top_outliers, aes(y = Predicted, label = round(Error, 2)), 
+            vjust = -1, color = "red", size = 3) +
+  labs(title = "PseudoHuber Forecast vs Actual (Top Outliers)",
+       subtitle = "Red points = largest prediction errors (1-day horizon)",
+       y = "Price (USD)", x = "Date") +
+  theme_minimal()
+```
+### 7.1 Error over Time
+```{r}
+ggplot(data, aes(x = Date, y = Error)) +
+  geom_line(color = "darkred") +
+  geom_point(data = top_outliers, color = "red", size = 2) +
+  labs(title = "Prediction Error Over Time (PseudoHuber)",
+       subtitle = "Spikes indicate large deviations",
+       y = "Absolute Error (USD)", x = "Date") +
+  theme_minimal()
+
+```
+
+Due to results from the perfomance comparison, we decided to not forecast with this model, since it has lack in performance for our data. This was not expected, since Pseudo-Huber is known as one of the best solution for loss functions.

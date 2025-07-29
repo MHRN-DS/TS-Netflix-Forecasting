@@ -1,0 +1,503 @@
+---
+title: "Arimax"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-05-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+
+```{r}
+library(tseries)
+library(forecast)
+library(dplyr)
+library(quantmod)
+library(tinytex)
+library(lmtest)
+library(dplyr)
+library(ggplot2)
+library(Metrics)
+library(lubridate)
+```
+
+
+# 1. Data Collection
+
+To build the ARIMAX model for predicting the stock price of Netflix (NFLX), historical data for Disney (DIS), Amazon (AMZN) and Warner Bros. Discovery (WBD) were also downloaded to serve as exogenous variables. We imported the last 5 years of adjusted closing prices for those stocks.
+
+```{r}
+start_date <- as.Date("2025-06-09") - years(5)
+tickers <- c("NFLX", "DIS", "AMZN", "WBD")
+
+getSymbols(tickers, src = "yahoo", from = start_date, to = as.Date("2025-06-06"))
+
+prices <- merge(Ad(NFLX), Ad(DIS), Ad(AMZN), Ad(WBD))
+colnames(prices) <- c("NFLX", "DIS", "AMZN", "WBD")
+prices <- na.omit(prices)
+
+df <- data.frame(Date = index(prices), coredata(prices))
+```
+
+
+```{r}
+df_new <- df[, c("NFLX", "DIS", "AMZN", "WBD")]
+```
+
+# 2. Stationarity testings
+
+```{r}
+adf.test(df_new$NFLX)
+```
+The Augmented Dickey-Fuller (ADF) test gives us a p-value greater than 0.05 indicating that the time series of the stock prices of Netflix is non-stationary. After a first-order differencing we achieved stationarity (p-value of ~0.01) since we have evidences for rejecting the null hypothesis of the test, as required for ARIMA modeling.
+
+```{r}
+diff_4arimax_ts <- ts(df_new$NFLX)
+diff_4arimax <- diff(diff_4arimax_ts, differences = 1)
+
+
+plot(diff_4arimax, main = "First Differencing")
+```
+```{r}
+adf.test(diff_4arimax)
+```
+The next step after applying the first-order differencing is to examine the ACF and PACF plots to identify the appropriate AR and MA orders for the model.
+
+```{r}
+acf(diff_4arimax)
+
+```
+```{r}
+pacf(diff_4arimax)
+```
+The ACF and PACF plots of the differenced series show no significant spikes outside the confidence bounds, indicating a lack of autocorrelation. This suggests that both the autoregressive (AR) and moving average (MA) parameters can be set to 0 for the model. 
+
+# 3. ARIMA Model
+
+The auto.arima function identified the best-fitting model as ARIMA(0,1,0), which aligns with our expectations based on the ACF and PACF analysis.
+
+```{r}
+
+arima<- auto.arima(df_new$NFLX, d = 1) 
+
+#Passing d=1 because we are using the auto function and we specify the 1st order diff.
+summary(arima)
+```
+The Mean Absolute Percentage Error (MAPE) is approximately 1.84%, indicating that on average, the model’s predictions are reflecting a good level of forecasting accuracy on the training data. Also, the Ljung-Box test on the residuals of the ARIMA(0,1,0) with drift model yields a Q* statistic of 9.43 with 10 degrees of freedom and a p-value of 0.49. Since the p-value is well above the common significance level (0.05), we fail to reject the null hypothesis that the residuals are independently distributed. This indicates no significant autocorrelation remains in the residuals, suggesting that the model has adequately captured the underlying data structure.
+
+```{r}
+checkresiduals(arima)
+
+```
+
+#####FIVE DAYS ARIMA
+
+```{r}
+# Set training window size and forecast horizon size
+train_window_size <- 252
+forecast_horizon <- 5
+
+# Vectors to store predictions and actual observed values 
+all_forecasts <- c()
+all_actuals <-c()
+
+netflix_series <- as.numeric(df_new$NFLX)
+
+# Perform rolling window forecasting using ARIMA(0,1,0)
+for (i in seq(1, length(netflix_series) - train_window_size - forecast_horizon + 1, by = forecast_horizon)) {
+  
+  # Select rolling training window
+  train_data <- netflix_series[i:(i + train_window_size - 1)]
+  
+  # Fit ARIMA(0,1,0) model on training data
+  model_1 <- arima(train_data, order = c(0,1,0))
+  
+  # Generate forecast for the next 5 days
+  forecasted <- forecast(model_1, h = forecast_horizon)$mean
+  
+  # Store forecasts and corresponding actual values
+  all_forecasts <- c(all_forecasts, forecasted)
+  actuals <- netflix_series[(i + train_window_size):(i + train_window_size + forecast_horizon - 1)]
+  all_actuals <- c(all_actuals, actuals)
+}
+```
+
+
+```{r}
+length(all_forecasts) == length(all_actuals)
+
+# Calculate accuracy metrics
+rmse_score <- rmse(all_actuals, all_forecasts)
+mae_score <- mae(all_actuals, all_forecasts)
+mape_score <- mape(all_actuals, all_forecasts) * 100  
+
+# Print results rounded up to two decimals
+cat("RMSE:", round(rmse_score, 2), "\n")
+cat("MAE:", round(mae_score, 2), "\n")
+cat("MAPE:", round(mape_score, 2), "%\n")
+
+```
+
+
+
+
+
+
+# 4. ARIMAX Model
+
+The ARIMAX (AutoRegressive Integrated Moving Average with eXogenous variables) model is an extension of the traditional ARIMA model that incorporates external predictors (exogenous variables) to improve forecasting accuracy. While ARIMA models rely solely on the historical values and past errors of the target time series, ARIMAX also includes the influence of other related time series or factors that may help explain or predict the behavior of the main series.
+Now we create the matrix of external variables for applying an ARIMAX.
+
+```{r}
+xreg <- as.matrix(df_new[, c("DIS", "AMZN", "WBD")])
+
+arimax_2 <- auto.arima(df_new$NFLX, xreg = xreg, d=1)
+summary(arimax_2)
+```
+The auto.arima() function selected a regression model with ARIMA(0,1,0) errors including exogenous variables (DIS, AMZN, and WBD). The coefficients indicate positive contributions from DIS (0.7582) and AMZN (1.7495), while WBD has a small negative effect (-0.1142). The drift term is estimated at 0.5168. Comparing model fit metrics with the previous ARIMA(0,1,0) model without exogenous variables, the ARIMAX model shows an improvement:
+
+-AIC: Reduced from 10066.91 to 9711, indicating a better trade-off between model complexity and goodness of fit.
+-BIC: Decreased from 10077.18 to 9736.67, further supporting the improved fit despite the additional parameters.
+-MAPE: Decreased from 1.84% to 1.50%, reflecting enhanced predictive accuracy on the training data.
+
+
+The Ljung-Box test performed on the residuals suggests that the residuals behave like white noise, indicating that the model has adequately captured the temporal dependencies
+
+```{r}
+checkresiduals(arimax_2)
+```
+# 5. Forecasting for ARIMAX using ARIMA models to predict the external predictors. 
+
+A key limitation of the ARIMAX model when used for forecasting is its dependence on the availability of the exogenous regressors (the "X" variables) at the forecast time points. Since the model incorporates these external predictors to improve accuracy, making forecasts requires knowing the future values of these regressors. If the exogenous variables are not available at time t (the forecast horizon), it becomes challenging to generate accurate forecasts from the ARIMAX model.
+
+To address this problem, we developed separate ARIMA models for AMZN, DIS, and WBD. These models were used to generate forecasts of the regressors themselves, which were then incorporated as input predictors in the ARIMAX model for NFLX. This approach allows us to overcome the limitation of missing future regressor data. For all exgenous data we are going to perform a 1st order differencing for making the series stationary. For the WBD series, we also perform a logaritmic transformation.
+
+```{r}
+p_values <- list(
+  DIS = adf.test(diff(df_new$DIS))$p.value,
+  WBD = adf.test(diff(log(df_new$WBD)))$p.value,
+  AMZN = adf.test(diff(df_new$AMZN))$p.value
+)
+
+print(p_values)
+
+```
+We also show that the residuals of the models exhibit no significant autocorrelation, as indicated by the Ljung-Box test p-values: 0.39422 for DIS, 0.3967 for WBD, and 0.89934 for AMZN. These results suggest that the ARIMA models for the regressors adequately capture the underlying data patterns, leaving residuals that behave like white noise, which supports the validity of using these forecasts as inputs for the ARIMAX model.
+
+```{r}
+
+library(forecast)
+
+models <- list(
+  DIS = auto.arima(df_new$DIS, d = 1),
+  WBD = auto.arima(log(df_new$WBD), d = 1),
+  AMZN = auto.arima(df_new$AMZN, d = 1)
+)
+
+cat("P-values of Ljung-Box test on residuals:\n")
+for(name in names(models)) {
+  # Estraggo residui
+  res <- residuals(models[[name]])
+  
+  # Faccio il test Ljung-Box (con lag = 10, ad esempio)
+  lb_test <- Box.test(res, lag = 10, type = "Ljung-Box")
+  
+  cat(paste0(name, ": p-value = ", round(lb_test$p.value, 5), "\n"))
+}
+
+```
+The next step was to implement the rolling_arimax_forecast() function that applies a rolling window forecast.
+
+The rolling window forecast is a forecasting method that repeatedly fits and tests the ARIMAX model over moving subsets (windows) of the data to better simulate real-time prediction performance.
+
+Here’s how it works step-by-step:
+
+Windowing:
+The function uses a fixed-length training window (window_size, 252 trading days) that “rolls” forward through the time series data. At each iteration, the window moves forward by step_size days (5 days), enabling multiple forecast rounds across the dataset.
+
+Forecasting the Exogenous Variables:
+For each window, separate ARIMA models are fitted to the regressors (DIS, AMZN, and WBD) using the data within the window. These models produce multi-step ahead forecasts (horizon 5 days) of the exogenous variables, which serve as predicted inputs for the ARIMAX model.
+
+Fitting the ARIMAX Model:
+Using the windowed target variable y_train (in our case Netflix stock prices) and the corresponding historical exogenous regressors (xreg_train), an ARIMAX model is fitted. The differencing order (d = 1) is set to ensure stationarity.
+
+Generating Forecasts:
+The ARIMAX model uses the forecasted future values of the regressors (xreg_future) to predict the target variable over the next 5 days.
+
+```{r}
+rolling_arimax_forecast <- function(y, xreg, window_size = 252, step_size = 5, horizon = 5) {
+  n <- length(y)
+  forecast_values <- list()
+  actual_values <- list()
+  start_points <- seq(from = window_size, to = n - horizon, by = step_size)
+  
+  for (start in start_points) {
+    window_data_dis <- df_new$DIS[(start - window_size + 1):start]
+    window_data_amzn <- df_new$AMZN[(start - window_size + 1):start]
+    window_data_wbd <- df_new$WBD[(start - window_size + 1):start]
+    
+    arima_dis <- auto.arima(window_data_dis, d = 1)
+    arima_amzn <- auto.arima(window_data_amzn, d = 1)
+    arima_wbd <- auto.arima(log(window_data_wbd), d = 1)
+    
+    forecast_result_dis <- forecast(arima_dis, h = 5)
+    pred_5_dis <- as.list(forecast_result_dis$mean)
+    forecast_result_amzn <- forecast(arima_amzn, h = 5)
+    pred_5_amzn <- as.list(forecast_result_amzn$mean)
+    forecast_result_wbd <- forecast(arima_wbd, h = 5)
+    pred_5_wbd <- as.list(forecast_result_wbd$mean)
+    
+    vec_dis <- unlist(forecast_result_dis$mean)
+    vec_amzn <- unlist(forecast_result_amzn$mean)
+    vec_wbd <- unlist(forecast_result_wbd$mean)
+
+
+    xreg_future <- cbind(vec_dis, vec_amzn, vec_wbd)
+    
+
+    
+    y_train <- y[(start - window_size + 1):start]
+    xreg_train <- xreg[(start - window_size + 1):start, ]
+
+   
+    model <- auto.arima(y_train, xreg = xreg_train, d = 1)
+    
+    fc <- forecast(model, h = horizon, xreg = xreg_future)
+
+    forecast_values[[length(forecast_values) + 1]] <- as.numeric(fc$mean)
+    actual_values[[length(actual_values) + 1]] <- y[(start + 1):(start + horizon)]
+  }
+  #print(summary(model))
+  return(list(forecasts = forecast_values, actuals = actual_values))
+}
+
+result <- rolling_arimax_forecast(y = df_new$NFLX, xreg)
+
+```
+
+
+For each rolling window, both the predicted values and the actual observed values over the forecast horizon are stored.
+
+```{r}
+df_results <- do.call(rbind, lapply(seq_along(result$forecasts), function(i) {
+  data.frame(
+    block = i,
+    day = 1:length(result$forecasts[[i]]),
+    forecast = result$forecasts[[i]],
+    actual = result$actuals[[i]]
+  )
+}))
+```
+
+
+```{r}
+if (is.ts(df_new$NFLX)) {
+  start_time <- time(df_new$NFLX)[1]
+  freq <- frequency(df_new$NFLX)
+  df_results <- df_results %>%
+    mutate(time = start_time + (block - 1) * 5 / freq + (day - 1) / freq)
+  
+} else {
+  df_results <- df_results %>%
+    mutate(time = (block - 1) * 5 + day)
+}
+
+actual_ts <- df_results %>% select(time, actual)
+forecast_ts <- df_results %>% select(time, forecast)
+
+plot_data <- df_results %>%
+  select(time, actual, forecast) %>%
+  tidyr::pivot_longer(cols = c("actual", "forecast"), 
+                      names_to = "series", values_to = "value")
+
+ggplot(plot_data, aes(x = time, y = value, color = series)) +
+  geom_line(size = 0.4) +
+  scale_color_manual(values = c("actual" = "blue", "forecast" = "red")) +
+  labs(title = "5 Days Rolling Window Forecast vs Actual Values",
+       x = "Time",
+       y = "Value",
+       color = "Serie") +
+  theme_minimal()
+```
+The plot compares the 5-day rolling window forecasts of NFLX stock prices with the actual observed values over time. The forecasted values (in red) closely follow the trend and fluctuations of the actual data (in blue), indicating that the model is capturing the underlying dynamics of the stock price effectively. 
+
+
+# 6. ARIMAX with lagged features
+
+```{r}
+df_lagged <- df_new %>%
+  transmute(
+    NFLX = NFLX,
+    AMZN_lag1 = lag(AMZN, 1),
+    DIS_lag1 = lag(DIS, 1),
+    WBD_lag1 = lag(WBD, 1)
+  )
+
+```
+
+```{r}
+
+df_lagged$AMZN_lag1[1] <- mean(df_lagged$AMZN_lag1, na.rm = TRUE)
+df_lagged$DIS_lag1[1]  <- mean(df_lagged$DIS_lag1, na.rm = TRUE)
+df_lagged$WBD_lag1[1]  <- mean(df_lagged$WBD_lag1, na.rm = TRUE)
+```
+
+
+```{r}
+rolling_arimax_forecast_lag <- function(y, xreg, window_size = 252, step_size = 5, horizon = 5) {
+  n <- length(y)
+  start_points <- seq(from = window_size, to = n - horizon, by = step_size)
+  
+  forecast_values <- c()
+  actual_values <- c()
+  
+  for (start in start_points) {
+    future_data_dis <- df_lagged$DIS_lag1[(start + 1):(start + horizon)]
+    future_data_amzn <- df_lagged$AMZN_lag1[(start + 1):(start + horizon)]
+    future_data_wbd <- df_lagged$WBD_lag1[(start + 1):(start + horizon)]
+    xreg_future <- cbind(future_data_dis, future_data_amzn, future_data_wbd)
+    
+    
+
+    
+    y_train <- y[(start - window_size + 1):start]
+    xreg_train <- xreg[(start - window_size + 1):start, ]
+
+   
+    model <- auto.arima(y_train, xreg = xreg_train, d = 1)
+    
+    
+    fc <- forecast(model, h = horizon, xreg = xreg_future)
+    
+    
+    forecast_values[[length(forecast_values) + 1]] <- as.numeric(fc$mean)
+    actual_values[[length(actual_values) + 1]] <- y[(start + 1):(start + horizon)]
+
+  }
+  #print(summary(model))
+  return(list(forecasts = forecast_values, actuals = actual_values))
+}
+
+result_lagged <- rolling_arimax_forecast_lag(y = df_new$NFLX, xreg)
+
+
+```
+
+```{r}
+df_results_lagged <- do.call(rbind, lapply(seq_along(result_lagged$forecasts), function(i) {
+  data.frame(
+    block = i,
+    day = 1:length(result_lagged$forecasts[[i]]),
+    forecast = result_lagged$forecasts[[i]],
+    actual = result_lagged$actuals[[i]]
+  )
+}))
+```
+
+```{r}
+if (is.ts(df_new$NFLX)) {
+  start_time <- time(df_new$NFLX)[1]
+  freq <- frequency(df_new$NFLX)
+  df_results_lagged <- df_results_lagged %>%
+    mutate(time = start_time + (block - 1) * 5 / freq + (day - 1) / freq)
+  
+} else {
+  df_results_lagged <- df_results_lagged %>%
+    mutate(time = (block - 1) * 5 + day)
+}
+
+actual_ts <- df_results_lagged %>% select(time, actual)
+forecast_ts <- df_results_lagged %>% select(time, forecast)
+
+plot_data <- df_results_lagged %>%
+  select(time, actual, forecast) %>%
+  tidyr::pivot_longer(cols = c("actual", "forecast"), 
+                      names_to = "series", values_to = "value")
+
+ggplot(plot_data, aes(x = time, y = value, color = series)) +
+  geom_line(size = 0.4) +
+  scale_color_manual(values = c("actual" = "blue", "forecast" = "red")) +
+  labs(title = "5 Days Rolling Window Forecast vs Actual Values",
+       x = "Time",
+       y = "Value",
+       color = "Serie") +
+  theme_minimal()
+
+```
+
+```{r}
+calculate_forecast_metrics <- function(df, seasonal_period = 1) {
+  actual <- df$actual
+  forecast <- df$forecast
+  errors <- forecast - actual
+  abs_errors <- abs(errors)
+  squared_errors <- errors^2
+  mae <- mean(abs_errors)
+  rmse <- sqrt(mean(squared_errors))
+  mape <- mean(abs_errors / ifelse(actual == 0, NA, actual), na.rm = TRUE) * 100
+  smape <- mean(2 * abs_errors / (abs(actual) + abs(forecast)), na.rm = TRUE) * 100
+
+  n <- length(actual)
+  if (n <= seasonal_period) {
+    mase_denom <- NA
+    mase <- NA
+    rmsse <- NA
+  } else {
+    naive_diff <- abs(diff(actual, lag = seasonal_period))
+    mase_denom <- mean(naive_diff, na.rm = TRUE)
+    mase <- mae / mase_denom
+    rmsse_denom <- mean(naive_diff^2, na.rm = TRUE)
+    rmsse <- rmse / sqrt(rmsse_denom)
+  }
+
+  return(list(
+    MAE = mae,
+    RMSE = rmse,
+    MAPE = mape,
+    sMAPE = smape,
+    MASE = mase,
+    RMSSE = rmsse
+  ))
+}
+
+```
+
+
+# Results of ARIMAX with predicted values
+
+```{r}
+calculate_forecast_metrics(df_results)
+
+```
+# Results of ARIMAX with lagged values
+
+```{r}
+calculate_forecast_metrics(df_results_lagged)
+
+```
+
+
+# 5 days forecast with ARIMAX. One-shot prediction.
+
+
+```{r}
+regs <- cbind(df_lagged$DIS_lag1, df_lagged$AMZN_lag1, df_lagged$WBD_lag1)
+```
+
+```{r}
+arimax_lagged_2 <- auto.arima(df_lagged$NFLX, xreg = regs)
+```
+
+
+```{r}
+summary(arimax_lagged_2)
+```
+
+```{r}
+plot(forecast(arimax_lagged_2, xreg = regs, h = 5, level = c(80, 95)))
+```
+
